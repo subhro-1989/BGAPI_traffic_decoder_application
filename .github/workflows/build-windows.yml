@@ -10,6 +10,8 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+  release:
+    types: [published]   # a release created on the GitHub website also gets the zip
 
 permissions:
   contents: write   # only used by the release job on v* tags
@@ -154,11 +156,14 @@ jobs:
         with:
           name: bgmon-windows-x64
           path: bgmon-windows-x64
-      - name: Create release with the zip
+      - name: Attach the zip to the release (create the release if it does not exist yet)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          zip -qr bgmon-windows-x64-${GITHUB_REF_NAME}.zip bgmon-windows-x64
-          gh release create "$GITHUB_REF_NAME" bgmon-windows-x64-${GITHUB_REF_NAME}.zip \
-             --repo "$GITHUB_REPOSITORY" --title "BGAPI Monitor $GITHUB_REF_NAME" \
-             --notes "Windows 10/11 x64 build. Unzip, run tests\\test_core.exe and tests\\test_proxy_bglib.exe, then bgmon.exe."
+          ZIP=bgmon-windows-x64-${GITHUB_REF_NAME}.zip
+          zip -qr "$ZIP" bgmon-windows-x64
+          if ! gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "BGAPI Monitor $GITHUB_REF_NAME" \
+               --notes "Windows 10/11 x64 build. Unzip, run tests\\test_core.exe and tests\\test_proxy_bglib.exe, then bgmon.exe."
+          fi
+          gh release upload "$GITHUB_REF_NAME" "$ZIP" --repo "$GITHUB_REPOSITORY" --clobber
