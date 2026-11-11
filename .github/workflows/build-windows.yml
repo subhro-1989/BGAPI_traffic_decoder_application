@@ -1,0 +1,160 @@
+# Builds BGAPI Monitor (bgmon.exe) for Windows 10/11 x64 with Qt 6.12 LTS + MinGW,
+# runs the core tests, and publishes a ready-to-run folder as a downloadable artifact.
+#
+# Download: repo -> Actions -> latest "Build Windows x64" run -> Artifacts -> bgmon-windows-x64
+# Tag a commit "v1.0" (or any v*) to also get the zip attached to a GitHub Release.
+
+name: Build Windows x64
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # only used by the release job on v* tags
+
+env:
+  QT_SPEC: "6.12"          # Qt 6.12 LTS: the last Qt release that supports Windows 10
+  MINGW_PREFERRED: "1510"  # Qt 6.12 is built with MinGW-w64 15.1
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install aqtinstall and Ninja
+        run: python -m pip install --upgrade aqtinstall ninja
+
+      - name: Install Qt (MinGW 64-bit + Qt Serial Port) and the matching MinGW
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = (python -m aqt list-qt windows desktop --spec $env:QT_SPEC --latest-version | Out-String).Trim()
+          if (-not $ver) { throw "No Qt $env:QT_SPEC release found" }
+          $archs = (python -m aqt list-qt windows desktop --arch $ver | Out-String) -split '\s+' | Where-Object { $_ }
+          Write-Host "Qt $ver architectures: $($archs -join ', ')"
+          $arch = $archs | Where-Object { $_ -match '^win64_mingw' } | Select-Object -First 1
+          if (-not $arch) { throw "No win64 MinGW build of Qt $ver" }
+          $mods = (python -m aqt list-qt windows desktop --modules $ver $arch | Out-String)
+          Write-Host "Modules: $mods"
+          if ($mods -notmatch 'qtserialport') { throw "qtserialport not offered for $ver $arch" }
+          python -m aqt install-qt windows desktop $ver $arch -m qtserialport -O C:\Qt
+          if ($LASTEXITCODE -ne 0) { throw "Qt install failed" }
+
+          $tools = (python -m aqt list-tool windows desktop | Out-String) -split '\s+' |
+                   Where-Object { $_ -match '^tools_mingw\d+$' }
+          Write-Host "MinGW tools offered: $($tools -join ', ')"
+          $tool = $tools | Where-Object { $_ -eq "tools_mingw$env:MINGW_PREFERRED" } | Select-Object -First 1
+          if (-not $tool) { $tool = $tools | Sort-Object { [int]($_ -replace '\D', '') } | Select-Object -Last 1 }
+          if (-not $tool) { throw "No MinGW tool package found" }
+          $variants = (python -m aqt list-tool windows desktop $tool | Out-String) -split '\s+' |
+                      Where-Object { $_ -match 'win64' }
+          $variant = $variants | Select-Object -Last 1
+          Write-Host "Installing $tool / $variant"
+          python -m aqt install-tool windows desktop $tool $variant -O C:\Qt
+          if ($LASTEXITCODE -ne 0) { throw "MinGW install failed" }
+
+          $qtDir = Get-ChildItem "C:\Qt\$ver" -Directory | Where-Object { $_.Name -like 'mingw*' } | Select-Object -First 1
+          $mingw = Get-ChildItem "C:\Qt\Tools" -Directory | Where-Object { $_.Name -match '^mingw\d+_64$' } |
+                   Sort-Object { [int]($_.Name -replace '\D', '') } | Select-Object -Last 1
+          if (-not $qtDir -or -not $mingw) { throw "Qt or MinGW folder not found under C:\Qt" }
+          "QT_DIR=$($qtDir.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "MINGW_DIR=$($mingw.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "QT_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "Qt: $($qtDir.FullName)   MinGW: $($mingw.FullName)"
+
+      - name: Configure and build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:QT_DIR\bin;$env:MINGW_DIR\bin;$env:PATH"
+          & "$env:MINGW_DIR\bin\g++.exe" --version
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release `
+                -DCMAKE_PREFIX_PATH="$env:QT_DIR" `
+                -DCMAKE_C_COMPILER="$env:MINGW_DIR/bin/gcc.exe" `
+                -DCMAKE_CXX_COMPILER="$env:MINGW_DIR/bin/g++.exe"
+          if ($LASTEXITCODE -ne 0) { throw "configure failed" }
+          cmake --build build
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:QT_DIR\bin;$env:MINGW_DIR\bin;$env:PATH"
+          ctest --test-dir build --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "tests failed" }
+
+      - name: Package (windeployqt)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:PATH = "$env:QT_DIR\bin;$env:MINGW_DIR\bin;$env:PATH"
+          New-Item -ItemType Directory -Force dist, dist\tests | Out-Null
+          Copy-Item build\bgmon.exe dist\
+          windeployqt --release --no-translations dist\bgmon.exe
+          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed" }
+          # the two test programs (statically linked: no DLLs needed)
+          Copy-Item build\test_core.exe, build\test_proxy_bglib.exe dist\tests\
+          Copy-Item README.md dist\
+          $sha = (Get-FileHash dist\bgmon.exe -Algorithm SHA256).Hash
+          @(
+            "BGAPI Monitor - Windows x64 build"
+            "Commit : $env:GITHUB_SHA"
+            "Qt     : $env:QT_VERSION (MinGW 64-bit), $(Split-Path $env:MINGW_DIR -Leaf)"
+            "Built  : $(Get-Date -Format 'yyyy-MM-dd HH:mm') UTC on GitHub Actions"
+            "SHA256 : bgmon.exe $sha"
+            ""
+            "1. Run tests\test_core.exe and tests\test_proxy_bglib.exe first (each must end with passed / PASSED)."
+            "2. Then run bgmon.exe - direct mode check: system_hello -> rsp_system_hello 0x0000."
+          ) | Set-Content dist\BUILD_INFO.txt
+          # smoke test: the deployed exe starts with only the dist folder + Windows on PATH, and quits by itself
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          $p = Start-Process -FilePath dist\bgmon.exe -ArgumentList '--quit-after','3000' -PassThru
+          if (-not $p.WaitForExit(30000)) { $p.Kill(); Write-Warning "bgmon.exe did not quit within 30 s (no desktop session on the runner?)" }
+          else {
+            $code = $p.ExitCode
+            Write-Host ("bgmon.exe smoke test exit code: 0x{0:X8}" -f $code)
+            # 0xC0000135 = a DLL is missing, 0xC000007B = wrong-architecture DLL: the package is broken
+            if ($code -eq -1073741515 -or $code -eq -1073741701) { throw "bgmon.exe cannot start from dist: missing or wrong DLL" }
+            if ($code -ne 0) { Write-Warning "bgmon.exe exited with a non-zero code on the runner" }
+          }
+          Get-ChildItem dist -Recurse | Select-Object FullName, Length | Format-Table -AutoSize
+
+      - name: Run the packaged tests from dist (proves the folder is self-contained)
+        shell: pwsh
+        run: |
+          $env:PATH = "C:\Windows\System32;C:\Windows"
+          & dist\tests\test_core.exe | Select-Object -Last 3
+          if ($LASTEXITCODE -ne 0) { throw "packaged test_core failed" }
+          & dist\tests\test_proxy_bglib.exe | Select-Object -Last 2
+          if ($LASTEXITCODE -ne 0) { throw "packaged test_proxy_bglib failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bgmon-windows-x64
+          path: dist
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bgmon-windows-x64
+          path: bgmon-windows-x64
+      - name: Create release with the zip
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          zip -qr bgmon-windows-x64-${GITHUB_REF_NAME}.zip bgmon-windows-x64
+          gh release create "$GITHUB_REF_NAME" bgmon-windows-x64-${GITHUB_REF_NAME}.zip \
+             --repo "$GITHUB_REPOSITORY" --title "BGAPI Monitor $GITHUB_REF_NAME" \
+             --notes "Windows 10/11 x64 build. Unzip, run tests\\test_core.exe and tests\\test_proxy_bglib.exe, then bgmon.exe."
