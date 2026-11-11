@@ -22,19 +22,23 @@ jobs:
   build:
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       - name: Install aqtinstall and Ninja
-        run: python -m pip install --upgrade aqtinstall ninja
+        # aqtinstall 3.3.0 (latest on PyPI) cannot see Qt >= 6.11 for Windows: Qt moved those
+        # packages into per-compiler folders (qt6_6120/qt6_6120_mingw). Support is merged on
+        # aqtinstall's main branch but not released yet, so pin that exact commit.
+        run: python -m pip install --upgrade "aqtinstall @ git+https://github.com/miurahr/aqtinstall@5a49f2b" ninja
 
       - name: Install Qt (MinGW 64-bit + Qt Serial Port) and the matching MinGW
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          python -m aqt version
           $ver = (python -m aqt list-qt windows desktop --spec $env:QT_SPEC --latest-version | Out-String).Trim()
           if (-not $ver) { throw "No Qt $env:QT_SPEC release found" }
           $archs = (python -m aqt list-qt windows desktop --arch $ver | Out-String) -split '\s+' | Where-Object { $_ }
